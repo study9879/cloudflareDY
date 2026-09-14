@@ -58,12 +58,6 @@ form.addEventListener('submit', async (event) => {
     });
 
     const data = await response.json();
-
-    if (response.status === 401 && data.loginRequired) {
-      window.location.href = '/';
-      return;
-    }
-
     if (!response.ok || !data.ok) {
       throw new Error(data.error || '生成失败');
     }
@@ -76,14 +70,9 @@ form.addEventListener('submit', async (event) => {
 
     emptyState.classList.add('hidden');
 
-    document.getElementById('statInputNodes').textContent =
-      data.counts.inputNodes;
-
-    document.getElementById('statEndpoints').textContent =
-      data.counts.preferredEndpoints;
-
-    document.getElementById('statOutputNodes').textContent =
-      data.counts.outputNodes;
+    document.getElementById('statInputNodes').textContent = data.counts.inputNodes;
+    document.getElementById('statEndpoints').textContent = data.counts.preferredEndpoints;
+    document.getElementById('statOutputNodes').textContent = data.counts.outputNodes;
 
     previewBody.innerHTML = data.preview
       .map(
@@ -104,14 +93,9 @@ form.addEventListener('submit', async (event) => {
       warningBox.classList.remove('hidden');
     }
 
-    resultSection.scrollIntoView({
-      behavior: 'smooth',
-      block: 'start',
-    });
+    resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (error) {
-    warningBox.textContent =
-      error.message || '请求失败';
-
+    warningBox.textContent = error.message || '请求失败';
     warningBox.classList.remove('hidden');
   } finally {
     submitBtn.disabled = false;
@@ -120,113 +104,67 @@ form.addEventListener('submit', async (event) => {
 });
 
 document.addEventListener('click', async (event) => {
-  const copyButton =
-    event.target.closest('[data-copy-target]');
-
+  const copyButton = event.target.closest('[data-copy-target]');
   if (copyButton) {
-    const input = document.getElementById(
-      copyButton.dataset.copyTarget
-    );
-
+    const input = document.getElementById(copyButton.dataset.copyTarget);
     if (!input?.value) {
       return;
     }
-
     try {
-      await navigator.clipboard.writeText(
-        input.value
-      );
-
-      const originalText =
-        copyButton.textContent;
-
+      await navigator.clipboard.writeText(input.value);
+      const originalText = copyButton.textContent;
       copyButton.textContent = '已复制';
-
       setTimeout(() => {
-        copyButton.textContent =
-          originalText;
+        copyButton.textContent = originalText;
       }, 1200);
     } catch {
       input.select();
       document.execCommand('copy');
     }
-
     return;
   }
 
-  const qrButton =
-    event.target.closest('[data-qrcode-target]');
-
+  const qrButton = event.target.closest('[data-qrcode-target]');
   if (qrButton) {
     warningBox.classList.add('hidden');
 
-    const input = document.getElementById(
-      qrButton.dataset.qrcodeTarget
-    );
-
+    const input = document.getElementById(qrButton.dataset.qrcodeTarget);
     if (!input?.value) {
-      warningBox.textContent =
-        '请先生成订阅链接，再显示二维码。';
-
+      warningBox.textContent = '请先生成订阅链接，再显示二维码。';
       warningBox.classList.remove('hidden');
-
       return;
     }
 
     if (!window.QRCode) {
-      warningBox.textContent =
-        '二维码组件加载失败，请刷新页面后重试。';
-
+      warningBox.textContent = '二维码组件加载失败，请刷新页面后重试。';
       warningBox.classList.remove('hidden');
-
       return;
     }
 
     qrCanvas.innerHTML = '';
-
-    qrText.textContent =
-      input.value;
-
+    qrText.textContent = input.value;
     qrModal.classList.remove('hidden');
-
-    qrModal.setAttribute(
-      'aria-hidden',
-      'false'
-    );
+    qrModal.setAttribute('aria-hidden', 'false');
 
     new window.QRCode(qrCanvas, {
       text: input.value,
       width: 220,
       height: 220,
-      correctLevel:
-        window.QRCode.CorrectLevel.M,
+      correctLevel: window.QRCode.CorrectLevel.M,
     });
-
     return;
   }
 
-  if (
-    event.target.closest(
-      '[data-close-modal="true"]'
-    )
-  ) {
+  if (event.target.closest('[data-close-modal="true"]')) {
     closeQrDialog();
   }
 });
 
-closeQrModal.addEventListener(
-  'click',
-  closeQrDialog
-);
+closeQrModal.addEventListener('click', closeQrDialog);
 
 function closeQrDialog() {
   qrModal.classList.add('hidden');
-
-  qrModal.setAttribute(
-    'aria-hidden',
-    'true'
-  );
-
+  qrModal.setAttribute('aria-hidden', 'true');
   qrCanvas.innerHTML = '';
 }
 
