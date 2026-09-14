@@ -1,7 +1,14 @@
 // Cloudflare Worker: KV short link subscription + access token protection
+//
 // Requires:
 // - KV namespace binding: SUB_STORE
 // - Secret/Variable: SUB_ACCESS_TOKEN
+//
+// Admin login:
+// - Secret: ADMIN_USERNAME
+// - Secret: ADMIN_PASSWORD
+// - Secret: SESSION_SECRET
+//
 // Optional:
 // - Secret/Variable: SUB_LINK_SECRET (legacy long-token compatibility)
 
@@ -13,11 +20,16 @@ function json(data, status = 200) {
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET,POST,OPTIONS',
       'access-control-allow-headers': 'content-type',
+      'cache-control': 'no-store',
     },
   });
 }
 
-function text(body, status = 200, contentType = 'text/plain; charset=utf-8') {
+function text(
+  body,
+  status = 200,
+  contentType = 'text/plain; charset=utf-8'
+) {
   return new Response(body, {
     status,
     headers: {
@@ -42,27 +54,503 @@ function escapeYaml(str = '') {
     .replace(/\n/g, ' ');
 }
 
+/* ============================================================
+ * Admin Session
+ * ========================================================== */
+
+const SESSION_COOKIE = 'cloudflaresub_session';
+const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
+
+function getCookie(request, name) {
+  const cookie = request.headers.get('Cookie') || '';
+
+  for (const part of cookie.split(';')) {
+    const trimmed = part.trim();
+
+    if (!trimmed) continue;
+
+    const separator = trimmed.indexOf('=');
+
+    if (separator === -1) continue;
+
+    const key = trimmed.slice(0, separator);
+    const value = trimmed.slice(separator + 1);
+
+    if (key === name) {
+      return value;
+    }
+  }
+
+  return '';
+}
+
+function base64UrlEncode(bytes) {
+  let binary = '';
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+async function hmacSign(value, secret) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    {
+      name: 'HMAC',
+      hash: 'SHA-256',
+    },
+    false,
+    ['sign']
+  );
+
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(value)
+  );
+
+  return base64UrlEncode(new Uint8Array(signature));
+}
+
+async function createSession(env) {
+  if (!env.SESSION_SECRET) {
+    throw new Error('缺少 SESSION_SECRET');
+  }
+
+  const timestamp = String(Date.now());
+
+  const signature = await hmacSign(
+    timestamp,
+    env.SESSION_SECRET
+  );
+
+  return `${timestamp}.${signature}`;
+}
+
+async function verifySession(request, env) {
+  if (!env.SESSION_SECRET) {
+    return false;
+  }
+
+  const session = getCookie(
+    request,
+    SESSION_COOKIE
+  );
+
+  if (!session) {
+    return false;
+  }
+
+  const parts = session.split('.');
+
+  if (parts.length !== 2) {
+    return false;
+  }
+
+  const [timestamp, signature] = parts;
+
+  if (!/^\d+$/.test(timestamp)) {
+    return false;
+  }
+
+  const createdAt = Number(timestamp);
+
+  if (!Number.isFinite(createdAt)) {
+    return false;
+  }
+
+  const age = Date.now() - createdAt;
+
+  if (age < 0 || age > SESSION_TTL * 1000) {
+    return false;
+  }
+
+  const expected = await hmacSign(
+    timestamp,
+    env.SESSION_SECRET
+  );
+
+  if (signature.length !== expected.length) {
+    return false;
+  }
+
+  let diff = 0;
+
+  for (let i = 0; i < signature.length; i++) {
+    diff |=
+      signature.charCodeAt(i) ^
+      expected.charCodeAt(i);
+  }
+
+  return diff === 0;
+}
+
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function loginPage(error = '') {
+  const errorHtml = error
+    ? `<div class="error">${escapeHtml(error)}</div>`
+    : '';
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>登录</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    "Microsoft YaHei",
+    sans-serif;
+  background: #f5f7fa;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 16px;
+}
+
+.login-box {
+  width: min(380px, 100%);
+  background: #fff;
+  border-radius: 16px;
+  padding: 32px;
+  box-shadow:
+    0 10px 35px rgba(0, 0, 0, .08);
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 24px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.subtitle {
+  margin-bottom: 24px;
+  text-align: center;
+  color: #777;
+  font-size: 14px;
+}
+
+label {
+  display: block;
+  margin: 14px 0 7px;
+  font-size: 14px;
+  color: #333;
+}
+
+input {
+  width: 100%;
+  height: 44px;
+  padding: 0 12px;
+  border: 1px solid #d9dfe7;
+  border-radius: 8px;
+  font-size: 15px;
+  outline: none;
+  background: #fff;
+}
+
+input:focus {
+  border-color: #1677ff;
+  box-shadow: 0 0 0 2px rgba(22, 119, 255, .1);
+}
+
+button {
+  width: 100%;
+  height: 44px;
+  margin-top: 22px;
+  border: 0;
+  border-radius: 8px;
+  background: #1677ff;
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+button:hover {
+  opacity: .92;
+}
+
+.error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fff1f0;
+  color: #cf1322;
+  font-size: 14px;
+  line-height: 1.5;
+}
+</style>
+</head>
+
+<body>
+
+<div class="login-box">
+
+  <h1>订阅生成器</h1>
+
+  <div class="subtitle">
+    请输入管理员账号和密码
+  </div>
+
+  ${errorHtml}
+
+  <form method="POST" action="/api/login">
+
+    <label for="username">
+      用户名
+    </label>
+
+    <input
+      id="username"
+      name="username"
+      type="text"
+      autocomplete="username"
+      required
+      autofocus
+    >
+
+    <label for="password">
+      密码
+    </label>
+
+    <input
+      id="password"
+      name="password"
+      type="password"
+      autocomplete="current-password"
+      required
+    >
+
+    <button type="submit">
+      登录
+    </button>
+
+  </form>
+
+</div>
+
+</body>
+</html>`;
+}
+
+async function handleLogin(request, env) {
+  const contentType =
+    request.headers.get('content-type') || '';
+
+  if (
+    !contentType.includes(
+      'application/x-www-form-urlencoded'
+    )
+  ) {
+    return new Response(
+      loginPage('登录请求格式错误'),
+      {
+        status: 400,
+        headers: {
+          'content-type':
+            'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      }
+    );
+  }
+
+  let form;
+
+  try {
+    form = await request.formData();
+  } catch {
+    return new Response(
+      loginPage('无法读取登录请求'),
+      {
+        status: 400,
+        headers: {
+          'content-type':
+            'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      }
+    );
+  }
+
+  const username = String(
+    form.get('username') || ''
+  );
+
+  const password = String(
+    form.get('password') || ''
+  );
+
+  if (
+    !env.ADMIN_USERNAME ||
+    !env.ADMIN_PASSWORD ||
+    !env.SESSION_SECRET
+  ) {
+    return new Response(
+      loginPage(
+        '服务器尚未完成管理员登录配置'
+      ),
+      {
+        status: 500,
+        headers: {
+          'content-type':
+            'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      }
+    );
+  }
+
+  if (
+    username !== env.ADMIN_USERNAME ||
+    password !== env.ADMIN_PASSWORD
+  ) {
+    return new Response(
+      loginPage('账号或密码错误'),
+      {
+        status: 401,
+        headers: {
+          'content-type':
+            'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      }
+    );
+  }
+
+  try {
+    const session = await createSession(env);
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: '/',
+        'Set-Cookie':
+          `${SESSION_COOKIE}=${session}; ` +
+          `Path=/; ` +
+          `Max-Age=${SESSION_TTL}; ` +
+          `HttpOnly; ` +
+          `Secure; ` +
+          `SameSite=Strict`,
+        'Cache-Control': 'no-store',
+      },
+    });
+  } catch {
+    return new Response(
+      loginPage('服务器 Session 配置错误'),
+      {
+        status: 500,
+        headers: {
+          'content-type':
+            'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      }
+    );
+  }
+}
+
+function handleLogout() {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: '/',
+      'Set-Cookie':
+        `${SESSION_COOKIE}=; ` +
+        `Path=/; ` +
+        `Max-Age=0; ` +
+        `HttpOnly; ` +
+        `Secure; ` +
+        `SameSite=Strict`,
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+function unauthorized() {
+  return json(
+    {
+      ok: false,
+      error: '未登录，请先登录',
+      loginRequired: true,
+    },
+    401
+  );
+}
+
+/* ============================================================
+ * Preferred endpoints
+ * ========================================================== */
+
 function parsePreferredEndpoints(input) {
   return String(input || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [raw, remark = ''] = line.split('#');
+      const [raw, remark = ''] =
+        line.split('#');
+
       const value = raw.trim();
       const hashRemark = remark.trim();
-      const match = value.match(/^(.*?)(?::(\d+))?$/);
+
+      const match =
+        value.match(/^(.*?)(?::(\d+))?$/);
+
       return {
         server: match?.[1] || value,
-        port: match?.[2] ? Number(match[2]) : undefined,
+        port: match?.[2]
+          ? Number(match[2])
+          : undefined,
         remark: hashRemark,
       };
     });
 }
 
+/* ============================================================
+ * VMess
+ * ========================================================== */
+
 function parseVmess(link) {
-  const raw = link.slice('vmess://'.length).trim();
-  const obj = JSON.parse(b64DecodeUtf8(raw));
+  const raw = link
+    .slice('vmess://'.length)
+    .trim();
+
+  const obj = JSON.parse(
+    b64DecodeUtf8(raw)
+  );
+
   return {
     type: 'vmess',
     name: obj.ps || 'vmess',
@@ -80,25 +568,69 @@ function parseVmess(link) {
   };
 }
 
+/* ============================================================
+ * VLESS / Trojan
+ * ========================================================== */
+
 function parseUrlLike(link, type) {
   const u = new URL(link);
+
   return {
     type,
-    name: decodeURIComponent(u.hash.replace(/^#/, '')) || type,
+    name:
+      decodeURIComponent(
+        u.hash.replace(/^#/, '')
+      ) || type,
+
     server: u.hostname,
+
     port: Number(u.port || 443),
-    password: type === 'trojan' ? decodeURIComponent(u.username) : undefined,
-    uuid: type === 'vless' ? decodeURIComponent(u.username) : undefined,
-    network: u.searchParams.get('type') || 'tcp',
-    tls: (u.searchParams.get('security') || '').toLowerCase() === 'tls',
-    host: u.searchParams.get('host') || u.searchParams.get('sni') || '',
-    path: u.searchParams.get('path') || '/',
-    sni: u.searchParams.get('sni') || u.searchParams.get('host') || '',
-    fp: u.searchParams.get('fp') || '',
-    alpn: u.searchParams.get('alpn') || '',
-    flow: u.searchParams.get('flow') || '',
+
+    password:
+      type === 'trojan'
+        ? decodeURIComponent(u.username)
+        : undefined,
+
+    uuid:
+      type === 'vless'
+        ? decodeURIComponent(u.username)
+        : undefined,
+
+    network:
+      u.searchParams.get('type') || 'tcp',
+
+    tls:
+      (
+        u.searchParams.get('security') || ''
+      ).toLowerCase() === 'tls',
+
+    host:
+      u.searchParams.get('host') ||
+      u.searchParams.get('sni') ||
+      '',
+
+    path:
+      u.searchParams.get('path') || '/',
+
+    sni:
+      u.searchParams.get('sni') ||
+      u.searchParams.get('host') ||
+      '',
+
+    fp:
+      u.searchParams.get('fp') || '',
+
+    alpn:
+      u.searchParams.get('alpn') || '',
+
+    flow:
+      u.searchParams.get('flow') || '',
   };
 }
+
+/* ============================================================
+ * Raw links
+ * ========================================================== */
 
 function parseRawLinks(input) {
   const lines = String(input || '')
@@ -107,53 +639,111 @@ function parseRawLinks(input) {
     .filter(Boolean);
 
   const result = [];
+
   for (const line of lines) {
     if (line.startsWith('vmess://')) {
       result.push(parseVmess(line));
       continue;
     }
+
     if (line.startsWith('vless://')) {
-      result.push(parseUrlLike(line, 'vless'));
+      result.push(
+        parseUrlLike(line, 'vless')
+      );
       continue;
     }
+
     if (line.startsWith('trojan://')) {
-      result.push(parseUrlLike(line, 'trojan'));
+      result.push(
+        parseUrlLike(line, 'trojan')
+      );
       continue;
     }
+
     try {
-      const decoded = b64DecodeUtf8(line);
-      if (/^(vmess|vless|trojan):\/\//m.test(decoded)) {
-        result.push(...parseRawLinks(decoded));
+      const decoded =
+        b64DecodeUtf8(line);
+
+      if (
+        /^(vmess|vless|trojan):\/\//m.test(
+          decoded
+        )
+      ) {
+        result.push(
+          ...parseRawLinks(decoded)
+        );
       }
     } catch {}
   }
+
   return result;
 }
 
-function buildNodes(baseNodes, preferredEndpoints, options = {}) {
+/* ============================================================
+ * Build nodes
+ * ========================================================== */
+
+function buildNodes(
+  baseNodes,
+  preferredEndpoints,
+  options = {}
+) {
   const output = [];
-  const prefix = (options.namePrefix || '').trim();
+
+  const prefix =
+    (options.namePrefix || '').trim();
+
   let counter = 0;
+
   for (const node of baseNodes) {
     for (const ep of preferredEndpoints) {
       counter += 1;
+
       const nameParts = [];
-      if (node.name) nameParts.push(node.name);
-      if (prefix) nameParts.push(prefix);
-      if (ep.remark) nameParts.push(ep.remark);
-      else nameParts.push(String(counter));
+
+      if (node.name) {
+        nameParts.push(node.name);
+      }
+
+      if (prefix) {
+        nameParts.push(prefix);
+      }
+
+      if (ep.remark) {
+        nameParts.push(ep.remark);
+      } else {
+        nameParts.push(String(counter));
+      }
+
       output.push({
         ...node,
+
         name: nameParts.join(' | '),
+
         server: ep.server,
-        port: ep.port || node.port,
-        host: options.keepOriginalHost ? node.host : '',
-        sni: options.keepOriginalHost ? node.sni : '',
+
+        port:
+          ep.port || node.port,
+
+        host:
+          options.keepOriginalHost
+            ? node.host
+            : '',
+
+        sni:
+          options.keepOriginalHost
+            ? node.sni
+            : '',
       });
     }
   }
+
   return output;
 }
+
+/* ============================================================
+ * VMess encode
+ * ========================================================== */
 
 function encodeVmess(node) {
   const obj = {
@@ -173,47 +763,181 @@ function encodeVmess(node) {
     alpn: node.alpn || '',
     fp: node.fp || '',
   };
-  return 'vmess://' + b64EncodeUtf8(JSON.stringify(obj));
+
+  return (
+    'vmess://' +
+    b64EncodeUtf8(
+      JSON.stringify(obj)
+    )
+  );
 }
+
+/* ============================================================
+ * VLESS encode
+ * ========================================================== */
 
 function encodeVless(node) {
-  const url = new URL(`vless://${encodeURIComponent(node.uuid)}@${node.server}:${node.port}`);
-  url.searchParams.set('type', node.network || 'ws');
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
-  if (node.flow) url.searchParams.set('flow', node.flow);
+  const url = new URL(
+    `vless://${encodeURIComponent(
+      node.uuid
+    )}@${node.server}:${node.port}`
+  );
+
+  url.searchParams.set(
+    'type',
+    node.network || 'ws'
+  );
+
+  if (node.tls) {
+    url.searchParams.set(
+      'security',
+      'tls'
+    );
+  }
+
+  if (node.host) {
+    url.searchParams.set(
+      'host',
+      node.host
+    );
+  }
+
+  if (node.sni) {
+    url.searchParams.set(
+      'sni',
+      node.sni
+    );
+  }
+
+  if (node.path) {
+    url.searchParams.set(
+      'path',
+      node.path
+    );
+  }
+
+  if (node.alpn) {
+    url.searchParams.set(
+      'alpn',
+      node.alpn
+    );
+  }
+
+  if (node.fp) {
+    url.searchParams.set(
+      'fp',
+      node.fp
+    );
+  }
+
+  if (node.flow) {
+    url.searchParams.set(
+      'flow',
+      node.flow
+    );
+  }
+
   url.hash = node.name;
+
   return url.toString();
 }
 
+/* ============================================================
+ * Trojan encode
+ * ========================================================== */
+
 function encodeTrojan(node) {
-  const url = new URL(`trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}`);
-  if (node.network) url.searchParams.set('type', node.network);
-  if (node.tls) url.searchParams.set('security', 'tls');
-  if (node.host) url.searchParams.set('host', node.host);
-  if (node.sni) url.searchParams.set('sni', node.sni);
-  if (node.path) url.searchParams.set('path', node.path);
-  if (node.alpn) url.searchParams.set('alpn', node.alpn);
-  if (node.fp) url.searchParams.set('fp', node.fp);
+  const url = new URL(
+    `trojan://${encodeURIComponent(
+      node.password
+    )}@${node.server}:${node.port}`
+  );
+
+  if (node.network) {
+    url.searchParams.set(
+      'type',
+      node.network
+    );
+  }
+
+  if (node.tls) {
+    url.searchParams.set(
+      'security',
+      'tls'
+    );
+  }
+
+  if (node.host) {
+    url.searchParams.set(
+      'host',
+      node.host
+    );
+  }
+
+  if (node.sni) {
+    url.searchParams.set(
+      'sni',
+      node.sni
+    );
+  }
+
+  if (node.path) {
+    url.searchParams.set(
+      'path',
+      node.path
+    );
+  }
+
+  if (node.alpn) {
+    url.searchParams.set(
+      'alpn',
+      node.alpn
+    );
+  }
+
+  if (node.fp) {
+    url.searchParams.set(
+      'fp',
+      node.fp
+    );
+  }
+
   url.hash = node.name;
+
   return url.toString();
 }
+
+/* ============================================================
+ * Raw output
+ * ========================================================== */
 
 function renderRaw(nodes) {
   const lines = nodes
     .map((node) => {
-      if (node.type === 'vmess') return encodeVmess(node);
-      if (node.type === 'vless') return encodeVless(node);
-      if (node.type === 'trojan') return encodeTrojan(node);
+      if (node.type === 'vmess') {
+        return encodeVmess(node);
+      }
+
+      if (node.type === 'vless') {
+        return encodeVless(node);
+      }
+
+      if (node.type === 'trojan') {
+        return encodeTrojan(node);
+      }
+
       return '';
     })
     .filter(Boolean);
-  return b64EncodeUtf8(lines.join('\n'));
+
+  return b64EncodeUtf8(
+    lines.join('\n')
+  );
 }
+
+/* ============================================================
+ * Clash output
+ * ========================================================== */
 
 function renderClash(nodes) {
   const proxies = nodes
@@ -233,15 +957,27 @@ function renderClash(nodes) {
         ];
 
         if (node.sni) {
-          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
+          lines.push(
+            `    servername: "${escapeYaml(
+              node.sni
+            )}"`
+          );
         }
 
-        if ((node.network || 'ws') === 'ws') {
+        if (
+          (node.network || 'ws') === 'ws'
+        ) {
           lines.push(
             `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      path: "${escapeYaml(
+              node.path || '/'
+            )}"`,
             `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+            `        Host: "${escapeYaml(
+              node.host ||
+              node.sni ||
+              ''
+            )}"`
           );
         }
 
@@ -261,15 +997,27 @@ function renderClash(nodes) {
         ];
 
         if (node.sni) {
-          lines.push(`    servername: "${escapeYaml(node.sni)}"`);
+          lines.push(
+            `    servername: "${escapeYaml(
+              node.sni
+            )}"`
+          );
         }
 
-        if ((node.network || 'ws') === 'ws') {
+        if (
+          (node.network || 'ws') === 'ws'
+        ) {
           lines.push(
             `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      path: "${escapeYaml(
+              node.path || '/'
+            )}"`,
             `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+            `        Host: "${escapeYaml(
+              node.host ||
+              node.sni ||
+              ''
+            )}"`
           );
         }
 
@@ -282,28 +1030,44 @@ function renderClash(nodes) {
           `    type: trojan`,
           `    server: ${node.server}`,
           `    port: ${node.port}`,
-          `    password: "${escapeYaml(node.password || '')}"`,
+          `    password: "${escapeYaml(
+            node.password || ''
+          )}"`,
           `    udp: true`,
         ];
 
         if (node.sni) {
-          lines.push(`    sni: "${escapeYaml(node.sni)}"`);
+          lines.push(
+            `    sni: "${escapeYaml(
+              node.sni
+            )}"`
+          );
         }
 
         if (node.tls !== false) {
-          lines.push(`    tls: true`);
+          lines.push(
+            `    tls: true`
+          );
         }
 
         if (node.network) {
-          lines.push(`    network: ${node.network}`);
+          lines.push(
+            `    network: ${node.network}`
+          );
         }
 
         if (node.network === 'ws') {
           lines.push(
             `    ws-opts:`,
-            `      path: "${escapeYaml(node.path || '/')}"`,
+            `      path: "${escapeYaml(
+              node.path || '/'
+            )}"`,
             `      headers:`,
-            `        Host: "${escapeYaml(node.host || node.sni || '')}"`
+            `        Host: "${escapeYaml(
+              node.host ||
+              node.sni ||
+              ''
+            )}"`
           );
         }
 
@@ -315,7 +1079,10 @@ function renderClash(nodes) {
     .filter(Boolean);
 
   const proxyNames = nodes.map(
-    (node) => `      - "${escapeYaml(node.name)}"`
+    (node) =>
+      `      - "${escapeYaml(
+        node.name
+      )}"`
   );
 
   const allGroupMembers = [
@@ -324,7 +1091,10 @@ function renderClash(nodes) {
     `      - DIRECT`,
   ];
 
-  const autoGroupMembers = proxyNames.length ? proxyNames : [`      - DIRECT`];
+  const autoGroupMembers =
+    proxyNames.length
+      ? proxyNames
+      : [`      - DIRECT`];
 
   return [
     `mixed-port: 7890`,
@@ -334,7 +1104,9 @@ function renderClash(nodes) {
     `ipv6: true`,
     ``,
     `proxies:`,
-    ...(proxies.length ? proxies : []),
+    ...(proxies.length
+      ? proxies
+      : []),
     ``,
     `proxy-groups:`,
     `  - name: "自动选择"`,
@@ -355,14 +1127,43 @@ function renderClash(nodes) {
   ].join('\n');
 }
 
-function renderSurge(nodes, baseUrl, accessToken) {
+/* ============================================================
+ * Surge output
+ * ========================================================== */
+
+function renderSurge(
+  nodes,
+  baseUrl,
+  accessToken
+) {
   const proxies = nodes
-    .filter((node) => node.type === 'vmess' || node.type === 'trojan')
+    .filter(
+      (node) =>
+        node.type === 'vmess' ||
+        node.type === 'trojan'
+    )
     .map((node) => {
       if (node.type === 'vmess') {
-        return `${node.name} = vmess, ${node.server}, ${node.port}, username=${node.uuid}, ws=true, ws-path=${node.path || '/'}, ws-headers=Host:${node.host || ''}, tls=${node.tls ? 'true' : 'false'}, sni=${node.sni || ''}`;
+        return (
+          `${node.name} = vmess, ` +
+          `${node.server}, ` +
+          `${node.port}, ` +
+          `username=${node.uuid}, ` +
+          `ws=true, ` +
+          `ws-path=${node.path || '/'}, ` +
+          `ws-headers=Host:${node.host || ''}, ` +
+          `tls=${node.tls ? 'true' : 'false'}, ` +
+          `sni=${node.sni || ''}`
+        );
       }
-      return `${node.name} = trojan, ${node.server}, ${node.port}, password=${node.password || ''}, sni=${node.sni || ''}`;
+
+      return (
+        `${node.name} = trojan, ` +
+        `${node.server}, ` +
+        `${node.port}, ` +
+        `password=${node.password || ''}, ` +
+        `sni=${node.sni || ''}`
+      );
     });
 
   return [
@@ -375,7 +1176,11 @@ function renderSurge(nodes, baseUrl, accessToken) {
     '[Proxy Group]',
     'Proxy = select, ' +
       nodes
-        .filter((n) => n.type === 'vmess' || n.type === 'trojan')
+        .filter(
+          (n) =>
+            n.type === 'vmess' ||
+            n.type === 'trojan'
+        )
         .map((n) => n.name)
         .join(', '),
     '',
@@ -387,24 +1192,56 @@ function renderSurge(nodes, baseUrl, accessToken) {
   ].join('\n');
 }
 
+/* ============================================================
+ * Short ID / KV
+ * ========================================================== */
+
 function createShortId(length = 10) {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  const chars =
+    'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+
+  const bytes =
+    crypto.getRandomValues(
+      new Uint8Array(length)
+    );
+
   let out = '';
+
   for (let i = 0; i < length; i++) {
-    out += chars[bytes[i] % chars.length];
+    out +=
+      chars[
+        bytes[i] % chars.length
+      ];
   }
+
   return out;
 }
 
-async function createUniqueShortId(env, tries = 8) {
+async function createUniqueShortId(
+  env,
+  tries = 8
+) {
   for (let i = 0; i < tries; i++) {
     const id = createShortId(10);
-    const exists = await env.SUB_STORE.get(`sub:${id}`);
-    if (!exists) return id;
+
+    const exists =
+      await env.SUB_STORE.get(
+        `sub:${id}`
+      );
+
+    if (!exists) {
+      return id;
+    }
   }
-  throw new Error('无法生成唯一短链接，请稍后再试');
+
+  throw new Error(
+    '无法生成唯一短链接，请稍后再试'
+  );
 }
+
+/* ============================================================
+ * Dedup
+ * ========================================================== */
 
 function normalizeLines(value = '') {
   return String(value)
@@ -416,165 +1253,535 @@ function normalizeLines(value = '') {
 }
 
 async function sha256Hex(input) {
-  const data = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest('SHA-256', data);
+  const data =
+    new TextEncoder().encode(input);
+
+  const digest =
+    await crypto.subtle.digest(
+      'SHA-256',
+      data
+    );
+
   return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, '0'))
+    .map((b) =>
+      b.toString(16).padStart(2, '0')
+    )
     .join('');
 }
 
 async function buildDedupHash(body) {
   const normalized = {
-    nodeLinks: normalizeLines(body.nodeLinks || ''),
-    preferredIps: normalizeLines(body.preferredIps || ''),
-    namePrefix: String(body.namePrefix || '').trim(),
-    keepOriginalHost: body.keepOriginalHost !== false,
+    nodeLinks:
+      normalizeLines(
+        body.nodeLinks || ''
+      ),
+
+    preferredIps:
+      normalizeLines(
+        body.preferredIps || ''
+      ),
+
+    namePrefix:
+      String(
+        body.namePrefix || ''
+      ).trim(),
+
+    keepOriginalHost:
+      body.keepOriginalHost !== false,
   };
-  return sha256Hex(JSON.stringify(normalized));
+
+  return sha256Hex(
+    JSON.stringify(normalized)
+  );
 }
 
-async function handleGenerate(request, env, url) {
+/* ============================================================
+ * Generate
+ * ========================================================== */
+
+async function handleGenerate(
+  request,
+  env,
+  url
+) {
+  /*
+   * 管理网页 API 必须登录。
+   *
+   * 注意：
+   * 这里不会影响 /sub/*。
+   */
+  if (
+    !(await verifySession(
+      request,
+      env
+    ))
+  ) {
+    return unauthorized();
+  }
+
   let body;
+
   try {
     body = await request.json();
   } catch {
-    return json({ ok: false, error: '请求体不是合法 JSON' }, 400);
+    return json(
+      {
+        ok: false,
+        error:
+          '请求体不是合法 JSON',
+      },
+      400
+    );
   }
 
-  const baseNodes = parseRawLinks(body.nodeLinks || '');
-  const preferredEndpoints = parsePreferredEndpoints(body.preferredIps || '');
+  const baseNodes =
+    parseRawLinks(
+      body.nodeLinks || ''
+    );
 
-  if (!baseNodes.length) return json({ ok: false, error: '没有识别到可用节点' }, 400);
-  if (!preferredEndpoints.length) return json({ ok: false, error: '没有识别到可用优选地址' }, 400);
+  const preferredEndpoints =
+    parsePreferredEndpoints(
+      body.preferredIps || ''
+    );
+
+  if (!baseNodes.length) {
+    return json(
+      {
+        ok: false,
+        error:
+          '没有识别到可用节点',
+      },
+      400
+    );
+  }
+
+  if (!preferredEndpoints.length) {
+    return json(
+      {
+        ok: false,
+        error:
+          '没有识别到可用优选地址',
+      },
+      400
+    );
+  }
 
   const options = {
-    namePrefix: body.namePrefix || '',
-    keepOriginalHost: body.keepOriginalHost !== false,
+    namePrefix:
+      body.namePrefix || '',
+
+    keepOriginalHost:
+      body.keepOriginalHost !== false,
   };
 
-  const nodes = buildNodes(baseNodes, preferredEndpoints, options);
+  const nodes = buildNodes(
+    baseNodes,
+    preferredEndpoints,
+    options
+  );
 
   const payload = {
     version: 1,
-    createdAt: new Date().toISOString(),
+
+    createdAt:
+      new Date().toISOString(),
+
     options,
+
     nodes,
   };
 
-  const dedupHash = await buildDedupHash(body);
-  const dedupKey = `dedup:${dedupHash}`;
+  const dedupHash =
+    await buildDedupHash(body);
 
-  let id = await env.SUB_STORE.get(dedupKey);
+  const dedupKey =
+    `dedup:${dedupHash}`;
+
+  let id =
+    await env.SUB_STORE.get(
+      dedupKey
+    );
 
   if (!id) {
-    id = await createUniqueShortId(env);
-    const ttl = 60 * 60 * 24 * 7; // 7天
+    id =
+      await createUniqueShortId(
+        env
+      );
 
-    await env.SUB_STORE.put(`sub:${id}`, JSON.stringify(payload), {
-      expirationTtl: ttl,
-    });
+    const ttl =
+      60 * 60 * 24 * 7;
 
-    await env.SUB_STORE.put(dedupKey, id, {
-      expirationTtl: ttl,
-    });
+    await env.SUB_STORE.put(
+      `sub:${id}`,
+      JSON.stringify(payload),
+      {
+        expirationTtl: ttl,
+      }
+    );
+
+    await env.SUB_STORE.put(
+      dedupKey,
+      id,
+      {
+        expirationTtl: ttl,
+      }
+    );
   }
 
-  const origin = url.origin;
-  const accessToken = env.SUB_ACCESS_TOKEN || '';
-  const withToken = (target) =>
-    `${origin}/sub/${id}${
-      target
-        ? `?target=${target}&token=${encodeURIComponent(accessToken)}`
-        : `?token=${encodeURIComponent(accessToken)}`
-    }`;
+  const origin =
+    url.origin;
+
+  const accessToken =
+    env.SUB_ACCESS_TOKEN || '';
+
+  const withToken =
+    (target) =>
+      `${origin}/sub/${id}${
+        target
+          ? `?target=${target}&token=${encodeURIComponent(
+              accessToken
+            )}`
+          : `?token=${encodeURIComponent(
+              accessToken
+            )}`
+      }`;
 
   return json({
     ok: true,
+
     storage: 'kv',
+
     deduplicated: true,
+
     shortId: id,
+
     urls: {
       auto: withToken(''),
       raw: withToken('raw'),
       clash: withToken('clash'),
       surge: withToken('surge'),
     },
+
     counts: {
-      inputNodes: baseNodes.length,
-      preferredEndpoints: preferredEndpoints.length,
-      outputNodes: nodes.length,
+      inputNodes:
+        baseNodes.length,
+
+      preferredEndpoints:
+        preferredEndpoints.length,
+
+      outputNodes:
+        nodes.length,
     },
-    preview: nodes.slice(0, 20).map((node) => ({
-      name: node.name,
-      type: node.type,
-      server: node.server,
-      port: node.port,
-      host: node.host || '',
-      sni: node.sni || '',
-    })),
-    warnings: accessToken ? [] : ['未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。'],
+
+    preview:
+      nodes
+        .slice(0, 20)
+        .map((node) => ({
+          name: node.name,
+          type: node.type,
+          server: node.server,
+          port: node.port,
+          host: node.host || '',
+          sni: node.sni || '',
+        })),
+
+    warnings:
+      accessToken
+        ? []
+        : [
+            '未检测到 SUB_ACCESS_TOKEN，订阅链接将没有第二层访问保护。',
+          ],
   });
 }
 
-function validateAccessToken(url, env) {
-  const expected = env.SUB_ACCESS_TOKEN;
-  if (!expected) return { ok: true };
-  const provided = url.searchParams.get('token') || '';
-  if (!provided || provided !== expected) {
-    return { ok: false, response: text('Forbidden: invalid token', 403) };
+/* ============================================================
+ * Subscription token
+ * ========================================================== */
+
+function validateAccessToken(
+  url,
+  env
+) {
+  const expected =
+    env.SUB_ACCESS_TOKEN;
+
+  /*
+   * 保留原有行为：
+   * 如果没有配置 SUB_ACCESS_TOKEN，
+   * 订阅接口不强制 token。
+   */
+  if (!expected) {
+    return {
+      ok: true,
+    };
   }
-  return { ok: true };
+
+  const provided =
+    url.searchParams.get(
+      'token'
+    ) || '';
+
+  if (
+    !provided ||
+    provided !== expected
+  ) {
+    return {
+      ok: false,
+
+      response:
+        text(
+          'Forbidden: invalid token',
+          403
+        ),
+    };
+  }
+
+  return {
+    ok: true,
+  };
 }
 
-async function handleSub(url, env) {
-  const tokenCheck = validateAccessToken(url, env);
-  if (!tokenCheck.ok) return tokenCheck.response;
+/* ============================================================
+ * Subscription endpoint
+ *
+ * IMPORTANT:
+ * /sub/* 不要求网页登录。
+ * 仍然只使用 SUB_ACCESS_TOKEN。
+ * ========================================================== */
 
-  const id = url.pathname.split('/').pop();
-  if (!id) return text('missing id', 400);
+async function handleSub(
+  url,
+  env
+) {
+  const tokenCheck =
+    validateAccessToken(
+      url,
+      env
+    );
 
-  const raw = await env.SUB_STORE.get(`sub:${id}`);
-  if (!raw) return text('not found', 404);
-
-  const record = JSON.parse(raw);
-  const nodes = record.nodes || [];
-  const target = (url.searchParams.get('target') || 'raw').toLowerCase();
-
-  if (target === 'clash') {
-    return text(renderClash(nodes), 200, 'text/yaml; charset=utf-8');
+  if (!tokenCheck.ok) {
+    return tokenCheck.response;
   }
-  if (target === 'surge') {
+
+  const id =
+    url.pathname
+      .split('/')
+      .pop();
+
+  if (!id) {
     return text(
-      renderSurge(nodes, url.origin + url.pathname, env.SUB_ACCESS_TOKEN || ''),
-      200,
-      'text/plain; charset=utf-8',
+      'missing id',
+      400
     );
   }
-  return text(renderRaw(nodes), 200, 'text/plain; charset=utf-8');
+
+  const raw =
+    await env.SUB_STORE.get(
+      `sub:${id}`
+    );
+
+  if (!raw) {
+    return text(
+      'not found',
+      404
+    );
+  }
+
+  const record =
+    JSON.parse(raw);
+
+  const nodes =
+    record.nodes || [];
+
+  const target =
+    (
+      url.searchParams.get(
+        'target'
+      ) || 'raw'
+    ).toLowerCase();
+
+  if (target === 'clash') {
+    return text(
+      renderClash(nodes),
+      200,
+      'text/yaml; charset=utf-8'
+    );
+  }
+
+  if (target === 'surge') {
+    return text(
+      renderSurge(
+        nodes,
+        url.origin +
+          url.pathname,
+        env.SUB_ACCESS_TOKEN ||
+          ''
+      ),
+      200,
+      'text/plain; charset=utf-8'
+    );
+  }
+
+  return text(
+    renderRaw(nodes),
+    200,
+    'text/plain; charset=utf-8'
+  );
 }
+
+/* ============================================================
+ * Worker
+ * ========================================================== */
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
+    /* --------------------------------------------------------
+     * OPTIONS
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'OPTIONS'
+    ) {
       return new Response(null, {
         headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
+          'access-control-allow-origin':
+            '*',
+
+          'access-control-allow-methods':
+            'GET,POST,OPTIONS',
+
+          'access-control-allow-headers':
+            'content-type',
         },
       });
     }
 
-    if (request.method === 'POST' && url.pathname === '/api/generate') {
-      return handleGenerate(request, env, url);
+    /* --------------------------------------------------------
+     * Login
+     *
+     * Public endpoint.
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'POST' &&
+      url.pathname ===
+        '/api/login'
+    ) {
+      return handleLogin(
+        request,
+        env
+      );
     }
 
-    if (request.method === 'GET' && url.pathname.startsWith('/sub/')) {
-      return handleSub(url, env);
+    /* --------------------------------------------------------
+     * Logout
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'GET' &&
+      url.pathname ===
+        '/api/logout'
+    ) {
+      return handleLogout();
     }
 
-    return env.ASSETS.fetch(request);
+    /* --------------------------------------------------------
+     * Subscription
+     *
+     * IMPORTANT:
+     * No admin Session required.
+     *
+     * Only SUB_ACCESS_TOKEN.
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'GET' &&
+      url.pathname.startsWith(
+        '/sub/'
+      )
+    ) {
+      return handleSub(
+        url,
+        env
+      );
+    }
+
+    /* --------------------------------------------------------
+     * Generate API
+     *
+     * Requires admin Session.
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'POST' &&
+      url.pathname ===
+        '/api/generate'
+    ) {
+      return handleGenerate(
+        request,
+        env,
+        url
+      );
+    }
+
+    /* --------------------------------------------------------
+     * Admin website / static assets
+     *
+     * Because wrangler.toml uses:
+     *
+     * run_worker_first = ["/*"]
+     *
+     * Worker gets a chance to authenticate
+     * every web asset before ASSETS serves it.
+     * ------------------------------------------------------ */
+
+    if (
+      request.method === 'GET'
+    ) {
+      const authenticated =
+        await verifySession(
+          request,
+          env
+        );
+
+      if (!authenticated) {
+        return new Response(
+          loginPage(),
+          {
+            status: 200,
+
+            headers: {
+              'content-type':
+                'text/html; charset=utf-8',
+
+              'cache-control':
+                'no-store',
+
+              'x-robots-tag':
+                'noindex, nofollow, noarchive',
+            },
+          }
+        );
+      }
+
+      return env.ASSETS.fetch(
+        request
+      );
+    }
+
+    return new Response(
+      'Method Not Allowed',
+      {
+        status: 405,
+
+        headers: {
+          'content-type':
+            'text/plain; charset=utf-8',
+        },
+      }
+    );
   },
 };
